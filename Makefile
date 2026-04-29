@@ -1,2 +1,2 @@
 default:
-	go build -ldflags "-s -w" -o file-check cli/main.go
+	go build -ldflags "-s -w" -o file-check cli/*.go
