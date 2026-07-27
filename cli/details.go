@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"hash"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,8 +34,7 @@ func getFileDetails(filePath string) (*FileDetails, error) {
 	fileInfo, err := os.Stat(filePath)
 
 	if err != nil {
-		log.Printf("Error getting file info for %q: %q. Skipping it...", details.FilePath, err)
-		return nil, err
+		return nil, fmt.Errorf("stat %q: %w", details.FilePath, err)
 	}
 
 	details.FileSize = fileInfo.Size()
@@ -51,8 +49,7 @@ func getFileDetails(filePath string) (*FileDetails, error) {
 	hash, mimeStr, err := hashAndDetectMime(hasher, details.FilePath)
 
 	if err != nil {
-		log.Printf("Error processing file %q: %q. Skipping it...", details.FilePath, err)
-		return nil, err
+		return nil, fmt.Errorf("hash and detect MIME %q: %w", details.FilePath, err)
 	}
 
 	details.SHA256 = hash

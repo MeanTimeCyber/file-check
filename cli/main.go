@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -13,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/dustin/go-humanize"
 )
 
 type fileResult struct {
@@ -23,11 +26,12 @@ type fileResult struct {
 
 func main() {
 	workers := flag.Int("workers", defaultWorkerCount(), "Number of worker goroutines for directory scans")
+	maxSize := flag.String("max-size", "", "Skip files larger than this size (e.g. 500MB, 2GiB)")
 	flag.Parse()
 
 	if flag.NArg() != 1 {
 		fmt.Printf("Input path is required.\n")
-		fmt.Printf("Usage: %s [-workers N] <file-or-directory>\n", os.Args[0])
+		fmt.Printf("Usage: %s [-workers N] [-max-size SIZE] <file-or-directory>\n", os.Args[0])
 		os.Exit(1)
 	}
 
@@ -45,17 +49,27 @@ func main() {
 		os.Exit(1)
 	}
 
+	maxSizeBytes, err := parseMaxSize(*maxSize)
+	if err != nil {
+		fmt.Printf("Invalid max-size value: %v\n", err)
+		os.Exit(1)
+	}
+
 	if inputInfo.IsDir() {
-		if err := processDirectory(inputPath, *workers); err != nil {
+		if err := processDirectory(inputPath, *workers, maxSizeBytes); err != nil {
 			fmt.Printf("Error processing directory: %s\n", err)
 			os.Exit(1)
 		}
 		return
 	}
 
+	if maxSizeBytes > 0 && inputInfo.Size() > maxSizeBytes {
+		fmt.Printf("Skipping file %s: size %s exceeds max-size %s\n", inputPath, humanize.Bytes(uint64(inputInfo.Size())), humanize.Bytes(uint64(maxSizeBytes)))
+		return
+	}
+
 	// Preserve single-file behavior.
 	details, err := getFileDetails(inputPath)
-
 	if err != nil {
 		fmt.Printf("Error processing file: %s\n", err)
 		os.Exit(1)
@@ -75,13 +89,28 @@ func defaultWorkerCount() int {
 	return n
 }
 
-func processDirectory(rootPath string, workers int) error {
+func processDirectory(rootPath string, workers int, maxSizeBytes int64) error {
 	reportPath := timestampedCSVName()
-	reportFile, err := os.Create(reportPath)
+	reportFile, err := os.CreateTemp(".", reportPath+".tmp-")
 	if err != nil {
-		return fmt.Errorf("create CSV report: %w", err)
+		return fmt.Errorf("create temporary CSV report: %w", err)
 	}
-	defer reportFile.Close()
+
+	reportTempPath := reportFile.Name()
+	reportFinalized := false
+	defer func() {
+		if reportFile != nil {
+			_ = reportFile.Close()
+		}
+		if !reportFinalized {
+			_ = os.Remove(reportTempPath)
+		}
+	}()
+
+	excludedPaths := map[string]struct{}{
+		absoluteCleanPath(reportTempPath): {},
+		absoluteCleanPath(reportPath):     {},
+	}
 
 	csvWriter := csv.NewWriter(reportFile)
 	if err := csvWriter.Write([]string{"file_path", "file_size", "extension", "sha256", "mime_type", "comment"}); err != nil {
@@ -92,6 +121,7 @@ func processDirectory(rootPath string, workers int) error {
 	results := make(chan fileResult, workers*4)
 
 	var wg sync.WaitGroup
+	var skipped int
 
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
@@ -117,6 +147,10 @@ func processDirectory(rootPath string, workers int) error {
 				return nil
 			}
 
+			if shouldSkipScanFile(path, excludedPaths) {
+				return nil
+			}
+
 			if d.Type()&os.ModeSymlink != 0 {
 				return nil
 			}
@@ -128,6 +162,11 @@ func processDirectory(rootPath string, workers int) error {
 			}
 
 			if !info.Mode().IsRegular() {
+				return nil
+			}
+
+			if maxSizeBytes > 0 && info.Size() > maxSizeBytes {
+				skipped++
 				return nil
 			}
 
@@ -192,10 +231,55 @@ func processDirectory(rootPath string, workers int) error {
 		return fmt.Errorf("flush CSV report: %w", err)
 	}
 
-	fmt.Printf("Processed %d files (passed=%d, failed=%d, errors=%d)\n", scanned, passed, failed, errored)
+	if err := reportFile.Sync(); err != nil {
+		return fmt.Errorf("sync CSV report: %w", err)
+	}
+
+	if err := reportFile.Close(); err != nil {
+		return fmt.Errorf("close CSV report: %w", err)
+	}
+	reportFile = nil
+
+	if err := os.Rename(reportTempPath, reportPath); err != nil {
+		return fmt.Errorf("finalize CSV report: %w", err)
+	}
+	reportFinalized = true
+
+	fmt.Printf("Processed %d files (passed=%d, failed=%d, skipped=%d, errors=%d)\n", scanned, passed, failed, skipped, errored)
 	fmt.Printf("CSV report: %s\n", reportPath)
 
 	return nil
+}
+
+func shouldSkipScanFile(path string, excludedPaths map[string]struct{}) bool {
+	if _, ok := excludedPaths[absoluteCleanPath(path)]; ok {
+		return true
+	}
+
+	return isGeneratedReportName(filepath.Base(path))
+}
+
+func absoluteCleanPath(path string) string {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return filepath.Clean(path)
+	}
+
+	return filepath.Clean(absPath)
+}
+
+func isGeneratedReportName(fileName string) bool {
+	if !strings.HasPrefix(fileName, "file-check-") || !strings.HasSuffix(fileName, ".csv") {
+		return false
+	}
+
+	stamp := strings.TrimSuffix(strings.TrimPrefix(fileName, "file-check-"), ".csv")
+	if len(stamp) != len("20060102-150405") {
+		return false
+	}
+
+	_, err := time.Parse("20060102-150405", stamp)
+	return err == nil
 }
 
 func isMimeCheckPass(comment string) bool {
@@ -205,4 +289,26 @@ func isMimeCheckPass(comment string) bool {
 func timestampedCSVName() string {
 	stamp := time.Now().Format("20060102-150405")
 	return fmt.Sprintf("file-check-%s.csv", stamp)
+}
+
+func parseMaxSize(value string) (int64, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return 0, nil
+	}
+
+	size, err := humanize.ParseBytes(trimmed)
+	if err != nil {
+		return 0, fmt.Errorf("%q (%w)", value, err)
+	}
+
+	if size == 0 {
+		return 0, fmt.Errorf("%q must be greater than zero", value)
+	}
+
+	if size > uint64(math.MaxInt64) {
+		return 0, fmt.Errorf("%q is too large", value)
+	}
+
+	return int64(size), nil
 }

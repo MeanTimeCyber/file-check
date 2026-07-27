@@ -39,6 +39,14 @@ Optional: set worker count for directory scans:
 go run ./cli -workers 8 /path/to/folder
 ```
 
+Optional: skip files larger than a size threshold:
+
+```bash
+go run ./cli -max-size 500MB /path/to/folder
+```
+
+`-max-size` also applies to single-file mode.
+
 When scanning a directory, non-mismatch results are written to a CSV file named like:
 
 ```text
