@@ -18,12 +18,23 @@ import (
 	"github.com/dustin/go-humanize"
 )
 
+// fileResult carries per-file worker output back to the directory aggregator.
 type fileResult struct {
 	path    string
 	details *FileDetails
 	err     error
 }
 
+// scanStats tracks aggregate scan outcomes for final reporting.
+type scanStats struct {
+	scanned int
+	passed  int
+	failed  int
+	skipped int
+	errored int
+}
+
+// main parses flags, validates input, and dispatches file or directory processing.
 func main() {
 	workers := flag.Int("workers", defaultWorkerCount(), "Number of worker goroutines for directory scans")
 	maxSize := flag.String("max-size", "", "Skip files larger than this size (e.g. 500MB, 2GiB)")
@@ -78,6 +89,7 @@ func main() {
 	details.PrettyPrint()
 }
 
+// defaultWorkerCount returns a laptop-safe default worker count for directory scans.
 func defaultWorkerCount() int {
 	n := runtime.NumCPU()
 	if n < 4 {
@@ -89,40 +101,93 @@ func defaultWorkerCount() int {
 	return n
 }
 
+// processDirectory scans files recursively, prints mismatches, and writes other results to CSV.
 func processDirectory(rootPath string, workers int, maxSizeBytes int64) error {
 	reportPath := timestampedCSVName()
+	reportFile, reportTempPath, markReportFinalized, cleanupReport, err := createTempReport(reportPath)
+	if err != nil {
+		return err
+	}
+	defer cleanupReport()
+
+	csvWriter, err := writeCSVHeader(reportFile)
+	if err != nil {
+		return err
+	}
+
+	excludedPaths := buildExcludedPaths(reportTempPath, reportPath)
+	jobs := make(chan string, workers*4)
+	results := make(chan fileResult, workers*4)
+
+	stats := scanStats{}
+	var workerWG sync.WaitGroup
+	startWorkerPool(workers, jobs, results, &workerWG)
+	startDirectoryWalk(rootPath, maxSizeBytes, excludedPaths, jobs, results, &stats)
+
+	go func() {
+		workerWG.Wait()
+		close(results)
+	}()
+
+	if err := consumeScanResults(results, csvWriter, &stats); err != nil {
+		return err
+	}
+
+	if err := finalizeTempReport(reportFile, reportTempPath, reportPath); err != nil {
+		return err
+	}
+	markReportFinalized()
+
+	fmt.Printf("Processed %d files (passed=%d, failed=%d, skipped=%d, errors=%d)\n", stats.scanned, stats.passed, stats.failed, stats.skipped, stats.errored)
+	fmt.Printf("CSV report: %s\n", reportPath)
+
+	return nil
+}
+
+// createTempReport creates the temporary output file and returns a cleanup function.
+func createTempReport(reportPath string) (*os.File, string, func(), func(), error) {
 	reportFile, err := os.CreateTemp(".", reportPath+".tmp-")
 	if err != nil {
-		return fmt.Errorf("create temporary CSV report: %w", err)
+		return nil, "", nil, nil, fmt.Errorf("create temporary CSV report: %w", err)
 	}
 
 	reportTempPath := reportFile.Name()
 	reportFinalized := false
-	defer func() {
+	markFinalized := func() {
+		reportFinalized = true
+	}
+	cleanup := func() {
 		if reportFile != nil {
 			_ = reportFile.Close()
 		}
 		if !reportFinalized {
 			_ = os.Remove(reportTempPath)
 		}
-	}()
+	}
 
-	excludedPaths := map[string]struct{}{
+	return reportFile, reportTempPath, markFinalized, cleanup, nil
+}
+
+// writeCSVHeader initializes the report writer and writes its header row.
+func writeCSVHeader(reportFile *os.File) (*csv.Writer, error) {
+	csvWriter := csv.NewWriter(reportFile)
+	if err := csvWriter.Write([]string{"file_path", "file_size", "extension", "sha256", "mime_type", "comment"}); err != nil {
+		return nil, fmt.Errorf("write CSV header: %w", err)
+	}
+
+	return csvWriter, nil
+}
+
+// buildExcludedPaths returns paths that should never be treated as scan inputs.
+func buildExcludedPaths(reportTempPath, reportPath string) map[string]struct{} {
+	return map[string]struct{}{
 		absoluteCleanPath(reportTempPath): {},
 		absoluteCleanPath(reportPath):     {},
 	}
+}
 
-	csvWriter := csv.NewWriter(reportFile)
-	if err := csvWriter.Write([]string{"file_path", "file_size", "extension", "sha256", "mime_type", "comment"}); err != nil {
-		return fmt.Errorf("write CSV header: %w", err)
-	}
-
-	jobs := make(chan string, workers*4)
-	results := make(chan fileResult, workers*4)
-
-	var wg sync.WaitGroup
-	var skipped int
-
+// startWorkerPool starts workers that process file jobs and emit results.
+func startWorkerPool(workers int, jobs <-chan string, results chan<- fileResult, wg *sync.WaitGroup) {
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
@@ -133,25 +198,18 @@ func processDirectory(rootPath string, workers int, maxSizeBytes int64) error {
 			}
 		}()
 	}
+}
 
-	wg.Add(1)
+// startDirectoryWalk traverses the directory and schedules eligible files for processing.
+func startDirectoryWalk(rootPath string, maxSizeBytes int64, excludedPaths map[string]struct{}, jobs chan<- string, results chan<- fileResult, stats *scanStats) {
 	go func() {
-		defer wg.Done()
 		walkErr := filepath.WalkDir(rootPath, func(path string, d fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				results <- fileResult{path: path, err: walkErr}
 				return nil
 			}
 
-			if d.IsDir() {
-				return nil
-			}
-
-			if shouldSkipScanFile(path, excludedPaths) {
-				return nil
-			}
-
-			if d.Type()&os.ModeSymlink != 0 {
+			if d.IsDir() || shouldSkipScanFile(path, excludedPaths) || d.Type()&os.ModeSymlink != 0 {
 				return nil
 			}
 
@@ -166,7 +224,7 @@ func processDirectory(rootPath string, workers int, maxSizeBytes int64) error {
 			}
 
 			if maxSizeBytes > 0 && info.Size() > maxSizeBytes {
-				skipped++
+				stats.skipped++
 				return nil
 			}
 
@@ -180,31 +238,24 @@ func processDirectory(rootPath string, workers int, maxSizeBytes int64) error {
 
 		close(jobs)
 	}()
+}
 
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	var scanned int
-	var passed int
-	var failed int
-	var errored int
-
+// consumeScanResults routes each processed result to CSV, console, or error counters.
+func consumeScanResults(results <-chan fileResult, csvWriter *csv.Writer, stats *scanStats) error {
 	for result := range results {
 		if result.err != nil {
-			errored++
+			stats.errored++
 			log.Printf("Error processing %q: %v", result.path, result.err)
 			continue
 		}
 
 		if result.details == nil {
-			errored++
+			stats.errored++
 			log.Printf("No details returned for %q", result.path)
 			continue
 		}
 
-		scanned++
+		stats.scanned++
 
 		if isMimeCheckPass(result.details.Comment) {
 			if err := csvWriter.Write([]string{
@@ -218,11 +269,11 @@ func processDirectory(rootPath string, workers int, maxSizeBytes int64) error {
 				return fmt.Errorf("write CSV record: %w", err)
 			}
 
-			passed++
+			stats.passed++
 			continue
 		}
 
-		failed++
+		stats.failed++
 		result.details.PrettyPrint()
 	}
 
@@ -231,6 +282,11 @@ func processDirectory(rootPath string, workers int, maxSizeBytes int64) error {
 		return fmt.Errorf("flush CSV report: %w", err)
 	}
 
+	return nil
+}
+
+// finalizeTempReport fsyncs, closes, and atomically renames the temporary report.
+func finalizeTempReport(reportFile *os.File, reportTempPath, reportPath string) error {
 	if err := reportFile.Sync(); err != nil {
 		return fmt.Errorf("sync CSV report: %w", err)
 	}
@@ -238,19 +294,15 @@ func processDirectory(rootPath string, workers int, maxSizeBytes int64) error {
 	if err := reportFile.Close(); err != nil {
 		return fmt.Errorf("close CSV report: %w", err)
 	}
-	reportFile = nil
 
 	if err := os.Rename(reportTempPath, reportPath); err != nil {
 		return fmt.Errorf("finalize CSV report: %w", err)
 	}
-	reportFinalized = true
-
-	fmt.Printf("Processed %d files (passed=%d, failed=%d, skipped=%d, errors=%d)\n", scanned, passed, failed, skipped, errored)
-	fmt.Printf("CSV report: %s\n", reportPath)
 
 	return nil
 }
 
+// shouldSkipScanFile reports whether a path should be excluded from directory scanning.
 func shouldSkipScanFile(path string, excludedPaths map[string]struct{}) bool {
 	if _, ok := excludedPaths[absoluteCleanPath(path)]; ok {
 		return true
@@ -259,6 +311,7 @@ func shouldSkipScanFile(path string, excludedPaths map[string]struct{}) bool {
 	return isGeneratedReportName(filepath.Base(path))
 }
 
+// absoluteCleanPath returns a normalized absolute path when possible.
 func absoluteCleanPath(path string) string {
 	absPath, err := filepath.Abs(path)
 	if err != nil {
@@ -268,6 +321,7 @@ func absoluteCleanPath(path string) string {
 	return filepath.Clean(absPath)
 }
 
+// isGeneratedReportName returns true for timestamped report filenames produced by this tool.
 func isGeneratedReportName(fileName string) bool {
 	if !strings.HasPrefix(fileName, "file-check-") || !strings.HasSuffix(fileName, ".csv") {
 		return false
@@ -282,15 +336,18 @@ func isGeneratedReportName(fileName string) bool {
 	return err == nil
 }
 
+// isMimeCheckPass classifies non-mismatch comments as CSV-eligible results.
 func isMimeCheckPass(comment string) bool {
 	return !strings.HasPrefix(comment, "Mismatch:")
 }
 
+// timestampedCSVName builds a report filename using the current local time.
 func timestampedCSVName() string {
 	stamp := time.Now().Format("20060102-150405")
 	return fmt.Sprintf("file-check-%s.csv", stamp)
 }
 
+// parseMaxSize parses a human-readable byte size string and returns bytes.
 func parseMaxSize(value string) (int64, error) {
 	trimmed := strings.TrimSpace(value)
 	if trimmed == "" {

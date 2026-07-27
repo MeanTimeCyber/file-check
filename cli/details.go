@@ -14,6 +14,7 @@ import (
 	"github.com/markkurossi/tabulate"
 )
 
+// FileDetails holds scan metadata and MIME comparison output for one file.
 type FileDetails struct {
 	FilePath  string
 	FileSize  int64
@@ -137,7 +138,7 @@ func isKnownExtensionVariant(extension, detectedMime string) bool {
 	}
 }
 
-// hashAndDetectMime opens the file once, hashing it while detecting the MIME type.
+// hashAndDetectMime opens a file once and computes hash plus detected MIME type.
 func hashAndDetectMime(h hash.Hash, filePathString string) (string, string, error) {
 	h.Reset()
 
