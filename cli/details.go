@@ -57,10 +57,7 @@ func getFileDetails(filePath string) (*FileDetails, error) {
 
 	details.SHA256 = hash
 	details.MimeType = mimeStr
-
-	if details.Extension != "" {
-		details.Comment = checkMimeAgainstExtension(details.Extension, details.MimeType)
-	}
+	details.Comment = checkMimeAgainstExtension(details.Extension, details.MimeType)
 
 	return &details, nil
 }
@@ -68,7 +65,7 @@ func getFileDetails(filePath string) (*FileDetails, error) {
 // checkMimeAgainstExtension compares the detected MIME type against the expected MIME type for the file extension, accounting for common aliases and known variations.
 func checkMimeAgainstExtension(extension, detectedMime string) string {
 	expectedMime, ok := extensionToMIME[strings.ToLower(extension)]
-	
+
 	if !ok {
 		return "No MIME mapping found for this extension"
 	}
@@ -189,7 +186,7 @@ func (f *FileDetails) PrettyPrint() {
 	row = table.Row()
 	row.Column("MIME Type")
 	row.Column(f.MimeType)
-	
+
 	if f.Comment != "" {
 		row = table.Row()
 		row.Column("Comment")
