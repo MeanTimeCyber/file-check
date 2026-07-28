@@ -71,11 +71,16 @@ func checkMimeAgainstExtension(extension, detectedMime string) string {
 	normalizedDetected := normalizeMimeType(detectedMime)
 	normalizedExpected := normalizeMimeType(expectedMime)
 
-	if normalizedDetected == normalizedExpected || isKnownExtensionVariant(extension, normalizedDetected) {
+	if normalizedDetected == normalizedExpected || isKnownExtensionVariant(extension, normalizedDetected) || isGenericTextPlainFallback(normalizedExpected, normalizedDetected) {
 		return fmt.Sprintf("Matches expected MIME for %s", extension)
 	}
 
 	return fmt.Sprintf("Mismatch: expected %s for %s", normalizedExpected, extension)
+}
+
+// isGenericTextPlainFallback accepts plain-text detection for text/* expectations.
+func isGenericTextPlainFallback(expectedMime, detectedMime string) bool {
+	return detectedMime == "text/plain" && strings.HasPrefix(expectedMime, "text/")
 }
 
 // normalizeMimeType standardizes MIME types for comparison, handling common aliases and variations.
@@ -121,6 +126,8 @@ func isKnownExtensionVariant(extension, detectedMime string) bool {
 		return detectedMime == "audio/aac" || detectedMime == "audio/mp4"
 	case ".mp4":
 		return detectedMime == "audio/mp4" || detectedMime == "video/mp4"
+	case ".go":
+		return detectedMime == "text/x-go" || detectedMime == "text/plain"
 	case ".pl":
 		return detectedMime == "application/x-perl" || detectedMime == "text/plain"
 	case ".rar":

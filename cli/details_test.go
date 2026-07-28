@@ -22,6 +22,34 @@ func TestCheckMimeAgainstExtension(t *testing.T) {
 		}
 	})
 
+	t.Run("charset parameter ignored", func(t *testing.T) {
+		got := checkMimeAgainstExtension(".txt", "text/plain; charset=utf-8")
+		if !strings.HasPrefix(got, "Matches expected MIME") {
+			t.Fatalf("expected charset-parameter match comment, got %q", got)
+		}
+	})
+
+	t.Run("go source accepts text plain detection", func(t *testing.T) {
+		got := checkMimeAgainstExtension(".go", "text/plain; charset=utf-8")
+		if !strings.HasPrefix(got, "Matches expected MIME") {
+			t.Fatalf("expected go/text-plain variant match comment, got %q", got)
+		}
+	})
+
+	t.Run("generic text plain fallback for text subtype", func(t *testing.T) {
+		got := checkMimeAgainstExtension(".c", "text/plain; charset=us-ascii")
+		if !strings.HasPrefix(got, "Matches expected MIME") {
+			t.Fatalf("expected text/* plain fallback match comment, got %q", got)
+		}
+	})
+
+	t.Run("no generic fallback for non text expected", func(t *testing.T) {
+		got := checkMimeAgainstExtension(".pdf", "text/plain; charset=utf-8")
+		if !strings.HasPrefix(got, "Mismatch:") {
+			t.Fatalf("expected mismatch for non-text expected MIME, got %q", got)
+		}
+	})
+
 	t.Run("mismatch", func(t *testing.T) {
 		got := checkMimeAgainstExtension(".txt", "image/png")
 		if !strings.HasPrefix(got, "Mismatch:") {
